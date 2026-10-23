@@ -1,5 +1,5 @@
-bucket = "seemat-s3-prod"
-key    = "prod/terraform.tfstate"
-region = "af-south-1"
-encrypt = true
-#use_lockfile = true
+bucket       = "ntombela-sva-s3-prod"
+key          = "prod/terraform.tfstate"
+region       = "af-south-1"
+encrypt      = true
+use_lockfile = true

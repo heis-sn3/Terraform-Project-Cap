@@ -1,50 +1,68 @@
-name: Terraform
-# terraform workflow for GitHub Actions
+name: Terraform CI/CD
+
+# Trigger on PR for plan, manual dispatch for apply/destroy
 on:
   pull_request:
     branches: [main]
-  push:
-    branches: [main]
+    paths:
+      - "**.tf"
+      - "**.tfvars"
+      - ".github/workflows/terraform.yml"
   workflow_dispatch:
     inputs:
       environment:
         description: "Environment to target"
         required: true
         type: choice
-        options: [dev, qa, prod]
+        options:
+          - dev
+          - qa
+          - prod
       action:
         description: "Terraform action"
         required: true
         type: choice
-        options: [plan, apply, destroy]
+        options:
+          - plan
+          - apply
 
 env:
   TF_IN_AUTOMATION: "true"
-  AWS_REGION: af-south-1
-  TF_VERSION: "1.9.8"
+  TF_VERSION: "1.16.4"
 
 permissions:
   contents: read
 
 jobs:
-  fmt:
-    name: Format & validate
+  # Format and validate on all changes
+  fmt-validate:
+    name: Format & Validate
     runs-on: ubuntu-latest
     permissions:
       contents: read
     steps:
-      - uses: actions/checkout@v4
-      - uses: hashicorp/setup-terraform@v3
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
         with:
           terraform_version: ${{ env.TF_VERSION }}
-      - run: terraform fmt -check -recursive
-      - run: terraform init -backend=false
-      - run: terraform validate
 
+      - name: Terraform Format Check
+        run: terraform fmt -check -recursive
+
+      - name: Terraform Init (validation only)
+        run: terraform init -backend=false
+
+      - name: Terraform Validate
+        run: terraform validate
+
+  # Plan for all environments on PR
   plan:
     name: Plan (${{ matrix.env }})
     if: github.event_name == 'pull_request'
-    needs: fmt
+    needs: fmt-validate
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false
@@ -55,45 +73,89 @@ jobs:
       id-token: write
       pull-requests: write
     steps:
-      - uses: actions/checkout@v4
+      - name: Checkout code
+        uses: actions/checkout@v4
 
-      - uses: aws-actions/configure-aws-credentials@v4
+      - name: Configure AWS Credentials
+        uses: aws-actions/configure-aws-credentials@v4
         with:
           aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
           aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
-          aws-region: ${{ env.AWS_REGION }}
+          aws-region: ${{ secrets.AWS_REGION }}
 
-      - uses: hashicorp/setup-terraform@v3
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
         with:
           terraform_version: ${{ env.TF_VERSION }}
 
-      - name: Init
+      - name: Terraform Init
         run: terraform init -backend-config=envs/${{ matrix.env }}/${{ matrix.env }}.tfbackend
 
-      - name: Plan
+      - name: Terraform Plan
         id: plan
+        env:
+          TF_VAR_prefix: ${{ secrets.TF_VAR_PREFIX }}
+          TF_VAR_app_name: ${{ secrets.TF_VAR_APP_NAME }}
+          TF_VAR_owner: ${{ secrets.TF_VAR_OWNER }}
         run: |
           terraform plan \
             -var-file=envs/${{ matrix.env }}/${{ matrix.env }}.tfvars \
-            -out=tfplan \
-            -no-color
-          terraform show -no-color tfplan > plan_output.txt
+            -out=tfplan-${{ matrix.env }} \
+            -no-color \
+            -detailed-exitcode || exit_code=$?
 
-      - name: Comment plan on PR
+          # Exit code 0 = no changes, 1 = error, 2 = changes present
+          if [ ${exit_code} -eq 1 ]; then
+            echo "Terraform plan failed"
+            exit 1
+          fi
+
+          terraform show -no-color tfplan-${{ matrix.env }} > plan_output.txt
+
+          echo "exit_code=${exit_code}" >> $GITHUB_OUTPUT
+
+      - name: Comment Plan on PR
         uses: actions/github-script@v7
         with:
           script: |
             const fs = require('fs');
             const plan = fs.readFileSync('plan_output.txt', 'utf8').slice(0, 60000);
+            const exitCode = '${{ steps.plan.outputs.exit_code }}';
             const marker = `<!-- terraform-plan-${{ matrix.env }} -->`;
-            const body = `${marker}\n### Terraform plan — \`${{ matrix.env }}\`\n<details><summary>Show plan</summary>\n\n\`\`\`\n${plan}\n\`\`\`\n</details>`;
+
+            let statusEmoji = '✅';
+            let statusText = 'No changes';
+
+            if (exitCode === '2') {
+              statusEmoji = '📝';
+              statusText = 'Changes detected';
+            } else if (exitCode === '1') {
+              statusEmoji = '❌';
+              statusText = 'Plan failed';
+            }
+
+            const body = `${marker}
+            ### ${statusEmoji} Terraform Plan — \`${{ matrix.env }}\`
+
+            **Status:** ${statusText}
+
+            <details><summary>Show plan</summary>
+
+            \`\`\`hcl
+            ${plan}
+            \`\`\`
+
+            </details>
+
+            <sub>Plan generated for commit: ${context.sha}</sub>`;
 
             const { data: comments } = await github.rest.issues.listComments({
               owner: context.repo.owner,
               repo: context.repo.repo,
               issue_number: context.issue.number,
             });
-            const existing = comments.find(c => c.body.startsWith(marker));
+
+            const existing = comments.find(c => c.body.includes(marker));
 
             if (existing) {
               await github.rest.issues.updateComment({
@@ -111,120 +173,61 @@ jobs:
               });
             }
 
-  apply:
-    name: Apply (${{ matrix.env }})
-    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
-    needs: fmt
-    runs-on: ubuntu-latest
-    strategy:
-      fail-fast: false
-      matrix:
-        env: [dev, qa, prod]
-    environment: ${{ matrix.env }}
-    concurrency:
-      group: terraform-apply-${{ matrix.env }}
-      cancel-in-progress: false
-    permissions:
-      contents: read
-      id-token: write
-    steps:
-      - uses: actions/checkout@v4
-
-      - uses: aws-actions/configure-aws-credentials@v4
-        with:
-          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
-          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
-          aws-region: ${{ env.AWS_REGION }}
-
-      - uses: hashicorp/setup-terraform@v3
-        with:
-          terraform_version: ${{ env.TF_VERSION }}
-
-      - name: Init
-        run: terraform init -backend-config=envs/${{ matrix.env }}/${{ matrix.env }}.tfbackend
-
-      - name: Apply
-        run: |
-          terraform apply \
-            -var-file=envs/${{ matrix.env }}/${{ matrix.env }}.tfvars \
-            -auto-approve \
-            -no-color
-
-  manual:
-    name: Manual ${{ github.event.inputs.action }} (${{ github.event.inputs.environment }})
+  # Manual workflow dispatch - plan or apply with approval
+  manual-operation:
+    name: ${{ github.event.inputs.action }} - ${{ github.event.inputs.environment }}
     if: github.event_name == 'workflow_dispatch'
     runs-on: ubuntu-latest
-    environment: ${{ github.event.inputs.environment }}
+    environment:
+      name: ${{ github.event.inputs.environment }}
+      url: https://console.aws.amazon.com/eks/home?region=${{ secrets.AWS_REGION }}
     concurrency:
-      group: terraform-apply-${{ github.event.inputs.environment }}
+      group: terraform-${{ github.event.inputs.environment }}
       cancel-in-progress: false
     permissions:
       contents: read
       id-token: write
     steps:
-      - uses: actions/checkout@v4
+      - name: Checkout code
+        uses: actions/checkout@v4
 
-      - uses: aws-actions/configure-aws-credentials@v4
+      - name: Configure AWS Credentials
+        uses: aws-actions/configure-aws-credentials@v4
         with:
           aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
           aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
-          aws-region: ${{ env.AWS_REGION }}
+          aws-region: ${{ secrets.AWS_REGION }}
 
-      - uses: hashicorp/setup-terraform@v3
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
         with:
           terraform_version: ${{ env.TF_VERSION }}
 
-      - name: Init
+      - name: Terraform Init
         run: terraform init -backend-config=envs/${{ github.event.inputs.environment }}/${{ github.event.inputs.environment }}.tfbackend
 
-      - name: Run
+      - name: Terraform ${{ github.event.inputs.action }}
+        env:
+          TF_VAR_prefix: ${{ secrets.TF_VAR_PREFIX }}
+          TF_VAR_app_name: ${{ secrets.TF_VAR_APP_NAME }}
+          TF_VAR_owner: ${{ secrets.TF_VAR_OWNER }}
         run: |
-          case "${{ github.event.inputs.action }}" in
-            plan)
-              terraform plan -var-file=envs/${{ github.event.inputs.environment }}/${{ github.event.inputs.environment }}.tfvars -no-color
-              ;;
-            apply)
-              terraform apply -var-file=envs/${{ github.event.inputs.environment }}/${{ github.event.inputs.environment }}.tfvars -auto-approve -no-color
-              ;;
-            destroy)
-              terraform destroy -var-file=envs/${{ github.event.inputs.environment }}/${{ github.event.inputs.environment }}.tfvars -auto-approve -no-color
-              ;;
-          esac
-  destroy-all:
-    name: Destroy All Environments
-    if: github.event_name == 'workflow_dispatch' && github.event.inputs.action == 'destroy'
-    needs: fmt
-    runs-on: ubuntu-latest
-    strategy:
-      fail-fast: false
-      matrix:
-        env: [dev, qa, prod]
-    environment: ${{ matrix.env }}
-    concurrency:
-      group: terraform-destroy-${{ matrix.env }}
-      cancel-in-progress: false
-    permissions:
-      contents: read
-      id-token: write
-    steps:
-      - uses: actions/checkout@v4
+          if [ "${{ github.event.inputs.action }}" == "plan" ]; then
+            terraform plan \
+              -var-file=envs/${{ github.event.inputs.environment }}/${{ github.event.inputs.environment }}.tfvars \
+              -no-color
+          elif [ "${{ github.event.inputs.action }}" == "apply" ]; then
+            terraform apply \
+              -var-file=envs/${{ github.event.inputs.environment }}/${{ github.event.inputs.environment }}.tfvars \
+              -auto-approve \
+              -no-color
+          fi
 
-      - uses: aws-actions/configure-aws-credentials@v4
-        with:
-          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
-          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
-          aws-region: ${{ env.AWS_REGION }}
-
-      - uses: hashicorp/setup-terraform@v3
-        with:
-          terraform_version: ${{ env.TF_VERSION }}
-
-      - name: Init
-        run: terraform init -backend-config=envs/${{ matrix.env }}/${{ matrix.env }}.tfbackend
-
-      - name: Destroy (${{ matrix.env }})
+      - name: Output Summary
+        if: github.event.inputs.action == 'apply'
         run: |
-          terraform destroy \
-            -var-file=envs/${{ matrix.env }}/${{ matrix.env }}.tfvars \
-            -auto-approve \
-            -no-color
+          echo "### ✅ Terraform Apply Completed" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "**Environment:** ${{ github.event.inputs.environment }}" >> $GITHUB_STEP_SUMMARY
+          echo "**Region:** ${{ secrets.AWS_REGION }}" >> $GITHUB_STEP_SUMMARY
+          echo "**Commit:** ${{ github.sha }}" >> $GITHUB_STEP_SUMMARY

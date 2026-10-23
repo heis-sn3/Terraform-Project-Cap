@@ -21,7 +21,7 @@ terraform {
 }
 
 provider "aws" {
-  region = "af-south-1"
+  region = var.aws_region
 }
 
 data "aws_caller_identity" "current" {}
@@ -37,7 +37,7 @@ resource "aws_iam_openid_connect_provider" "github" {
   ]
 
   thumbprint_list = [
-    "6938fd4d98bab03faadb97b34396831e3780aea",
+    "6938fd4d98bab03faadb97b34396831e3780aea1",
     "1c58a3a8518e8759bf075b76b750d4f2df264fcd",
   ]
 }
@@ -129,14 +129,12 @@ resource "aws_iam_role_policy" "github_actions" {
           "s3:DeleteObject",
           "s3:ListBucket",
         ]
-        Resource = [
-          "arn:aws:s3:::seemat-s3-dev",
-          "arn:aws:s3:::seemat-s3-dev/*",
-          "arn:aws:s3:::seemat-s3-qa",
-          "arn:aws:s3:::seemat-s3-qa/*",
-          "arn:aws:s3:::seemat-s3-prod",
-          "arn:aws:s3:::seemat-s3-prod/*",
-        ]
+        Resource = flatten([
+          for e in var.environments : [
+            "arn:aws:s3:::${var.prefix}-s3-${e}",
+            "arn:aws:s3:::${var.prefix}-s3-${e}/*",
+          ]
+        ])
       }
     ]
   })

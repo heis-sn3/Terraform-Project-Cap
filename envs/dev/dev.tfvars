@@ -1,3 +1,10 @@
-environment       = "dev"
-enable_versioning = false
-prefix            = "seemat"
+environment    = "dev"
+rsrc           = "eks"
+aws_region     = "af-south-1"
+eks_version    = "1.37"
+subnet_cidrs   = ["172.31.116.0/24", "172.31.117.0/24", "172.31.118.0/24"]
+instance_types = ["t3.small"]
+capacity_type  = "SPOT"
+node_min       = 1
+node_max       = 2
+node_desired   = 1

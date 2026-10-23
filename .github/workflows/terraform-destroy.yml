@@ -1,0 +1,200 @@
+name: Terraform Destroy
+
+# Manual trigger only for destroy operations
+on:
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: "Environment to destroy"
+        required: true
+        type: choice
+        options:
+          - dev
+          - qa
+          - prod
+      destroy_all:
+        description: "Destroy ALL environments (dangerous!)"
+        required: false
+        type: boolean
+        default: false
+      confirmation:
+        description: 'Type "destroy" to confirm'
+        required: true
+        type: string
+
+env:
+  TF_IN_AUTOMATION: "true"
+  TF_VERSION: "1.16.4"
+
+permissions:
+  contents: read
+
+jobs:
+  # Validate confirmation input
+  validate-confirmation:
+    name: Validate Confirmation
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check Confirmation
+        run: |
+          if [ "${{ github.event.inputs.confirmation }}" != "destroy" ]; then
+            echo "❌ Confirmation failed. You must type 'destroy' to proceed."
+            exit 1
+          fi
+          echo "✅ Confirmation validated"
+
+  # Destroy single environment
+  destroy-single:
+    name: Destroy ${{ github.event.inputs.environment }}
+    if: github.event.inputs.destroy_all == 'false'
+    needs: validate-confirmation
+    runs-on: ubuntu-latest
+    environment:
+      name: ${{ github.event.inputs.environment }}-destroy
+    concurrency:
+      group: terraform-destroy-${{ github.event.inputs.environment }}
+      cancel-in-progress: false
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Configure AWS Credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ secrets.AWS_REGION }}
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ env.TF_VERSION }}
+
+      - name: Terraform Init
+        run: terraform init -backend-config=envs/${{ github.event.inputs.environment }}/${{ github.event.inputs.environment }}.tfbackend
+
+      - name: Terraform Plan Destroy
+        env:
+          TF_VAR_prefix: ${{ secrets.TF_VAR_PREFIX }}
+          TF_VAR_app_name: ${{ secrets.TF_VAR_APP_NAME }}
+          TF_VAR_owner: ${{ secrets.TF_VAR_OWNER }}
+        run: |
+          echo "🔍 Generating destroy plan for ${{ github.event.inputs.environment }}..."
+          terraform plan -destroy \
+            -var-file=envs/${{ github.event.inputs.environment }}/${{ github.event.inputs.environment }}.tfvars \
+            -no-color
+
+      - name: Terraform Destroy
+        env:
+          TF_VAR_prefix: ${{ secrets.TF_VAR_PREFIX }}
+          TF_VAR_app_name: ${{ secrets.TF_VAR_APP_NAME }}
+          TF_VAR_owner: ${{ secrets.TF_VAR_OWNER }}
+        run: |
+          echo "🗑️  Destroying ${{ github.event.inputs.environment }} environment..."
+          terraform destroy \
+            -var-file=envs/${{ github.event.inputs.environment }}/${{ github.event.inputs.environment }}.tfvars \
+            -auto-approve \
+            -no-color
+
+      - name: Output Summary
+        if: always()
+        run: |
+          if [ $? -eq 0 ]; then
+            echo "### ✅ Destroy Completed" >> $GITHUB_STEP_SUMMARY
+            echo "" >> $GITHUB_STEP_SUMMARY
+            echo "**Environment:** ${{ github.event.inputs.environment }}" >> $GITHUB_STEP_SUMMARY
+            echo "**Status:** Successfully destroyed" >> $GITHUB_STEP_SUMMARY
+          else
+            echo "### ❌ Destroy Failed" >> $GITHUB_STEP_SUMMARY
+            echo "" >> $GITHUB_STEP_SUMMARY
+            echo "**Environment:** ${{ github.event.inputs.environment }}" >> $GITHUB_STEP_SUMMARY
+            echo "**Status:** Destroy operation failed" >> $GITHUB_STEP_SUMMARY
+          fi
+
+  # Destroy all environments sequentially (high risk!)
+  destroy-all:
+    name: Destroy All - ${{ matrix.env }}
+    if: github.event.inputs.destroy_all == 'true'
+    needs: validate-confirmation
+    runs-on: ubuntu-latest
+    strategy:
+      # Sequential destruction: one at a time, stop if any fails
+      fail-fast: true
+      max-parallel: 1
+      matrix:
+        env: [dev, qa, prod]
+    environment:
+      name: ${{ matrix.env }}-destroy
+    concurrency:
+      group: terraform-destroy-${{ matrix.env }}
+      cancel-in-progress: false
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Configure AWS Credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ secrets.AWS_REGION }}
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ env.TF_VERSION }}
+
+      - name: Terraform Init
+        run: terraform init -backend-config=envs/${{ matrix.env }}/${{ matrix.env }}.tfbackend
+
+      - name: Terraform Plan Destroy
+        env:
+          TF_VAR_prefix: ${{ secrets.TF_VAR_PREFIX }}
+          TF_VAR_app_name: ${{ secrets.TF_VAR_APP_NAME }}
+          TF_VAR_owner: ${{ secrets.TF_VAR_OWNER }}
+        run: |
+          echo "🔍 Generating destroy plan for ${{ matrix.env }}..."
+          terraform plan -destroy \
+            -var-file=envs/${{ matrix.env }}/${{ matrix.env }}.tfvars \
+            -no-color
+
+      - name: Terraform Destroy
+        env:
+          TF_VAR_prefix: ${{ secrets.TF_VAR_PREFIX }}
+          TF_VAR_app_name: ${{ secrets.TF_VAR_APP_NAME }}
+          TF_VAR_owner: ${{ secrets.TF_VAR_OWNER }}
+        run: |
+          echo "🗑️  Destroying ${{ matrix.env }} environment..."
+          terraform destroy \
+            -var-file=envs/${{ matrix.env }}/${{ matrix.env }}.tfvars \
+            -auto-approve \
+            -no-color
+
+      - name: Output Summary
+        run: |
+          echo "### ✅ ${{ matrix.env }} Destroyed" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "**Environment:** ${{ matrix.env }}" >> $GITHUB_STEP_SUMMARY
+          echo "**Timestamp:** $(date -u '+%Y-%m-%d %H:%M:%S UTC')" >> $GITHUB_STEP_SUMMARY
+
+  # Final summary for destroy all
+  destroy-all-summary:
+    name: Destroy All Summary
+    if: github.event.inputs.destroy_all == 'true'
+    needs: destroy-all
+    runs-on: ubuntu-latest
+    steps:
+      - name: Summary
+        run: |
+          echo "### 🗑️  All Environments Destroyed" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "All environments (dev, qa, prod) have been destroyed." >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "**Triggered by:** ${{ github.actor }}" >> $GITHUB_STEP_SUMMARY
+          echo "**Timestamp:** $(date -u '+%Y-%m-%d %H:%M:%S UTC')" >> $GITHUB_STEP_SUMMARY

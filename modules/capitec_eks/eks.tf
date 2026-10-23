@@ -1,36 +1,16 @@
-resource "aws_vpc" "main" {
-  cidr_block = "10.0.0.0/16"
+# Reference the default VPC and existing subnets
+data "aws_vpc" "default" {
+  default = true
 }
 
-resource "aws_subnet" "public" {
-  count                   = length(var.availability_zones)
-  vpc_id                  = aws_vpc.main.id
-  cidr_block              = cidrsubnet(aws_vpc.main.cidr_block, 8, count.index)
-  availability_zone       = var.availability_zones[count.index]
-  map_public_ip_on_launch = true
-
-  lifecycle {
-    ignore_changes = [tags]
-  }
+data "aws_subnet" "selected" {
+  for_each   = toset(var.subnet_cidrs)
+  vpc_id     = data.aws_vpc.default.id
+  cidr_block = each.value
 }
 
-resource "aws_internet_gateway" "main" {
-  vpc_id = aws_vpc.main.id
-}
-
-resource "aws_route_table" "public" {
-  vpc_id = aws_vpc.main.id
-
-  route {
-    cidr_block = "0.0.0.0/0"
-    gateway_id = aws_internet_gateway.main.id
-  }
-}
-
-resource "aws_route_table_association" "public" {
-  count          = length(aws_subnet.public)
-  subnet_id      = aws_subnet.public[count.index].id
-  route_table_id = aws_route_table.public.id
+locals {
+  subnet_ids = [for s in data.aws_subnet.selected : s.id]
 }
 
 resource "aws_eks_cluster" "example" {
@@ -42,10 +22,10 @@ resource "aws_eks_cluster" "example" {
   }
 
   role_arn = aws_iam_role.cluster.arn
-  version  = "1.35"
+  version  = var.eks_version
 
   vpc_config {
-    subnet_ids = aws_subnet.public[*].id
+    subnet_ids = local.subnet_ids
   }
 
   # Ensure that IAM Role permissions are created before and deleted
@@ -103,7 +83,7 @@ resource "aws_eks_access_policy_association" "admin" {
 }
 
 resource "aws_iam_role" "node" {
-  name = "${var.prefix}-eks-node-role-${var.environment}"
+  name = local.node_role_name
   assume_role_policy = jsonencode({
     Version = "2012-10-17"
     Statement = [
@@ -133,29 +113,50 @@ resource "aws_iam_role_policy_attachment" "node_AmazonEC2ContainerRegistryReadOn
   role       = aws_iam_role.node.name
 }
 
-resource "aws_security_group_rule" "nodeport_ingress" {
-  type              = "ingress"
-  from_port         = 30007
-  to_port           = 30007
-  protocol          = "tcp"
-  cidr_blocks       = ["0.0.0.0/0"]
+resource "aws_vpc_security_group_ingress_rule" "nodeport" {
   security_group_id = aws_eks_cluster.example.vpc_config[0].cluster_security_group_id
   description       = "Allow inbound access to nginx NodePort service"
+  from_port         = var.nodeport_from
+  to_port           = var.nodeport_to
+  ip_protocol       = "tcp"
+  cidr_ipv4         = "0.0.0.0/0"
+}
+
+# Launch template for the worker nodes. Its only job is to force a public IP
+# onto each node's primary ENI so nodes are directly reachable (NodePort demo).
+# We deliberately omit image_id/instance_type/user_data so EKS still injects the
+# EKS-optimized AMI, bootstrap script, and (via the node group) SPOT instance
+# types. Because specifying network_interfaces overrides the default ENI, we must
+# attach the cluster security group here — it carries the :30007 ingress rule.
+resource "aws_launch_template" "node" {
+  name_prefix = "${local.node_group_name}-"
+  description = "EKS worker nodes with public IPs on launch"
+
+  network_interfaces {
+    associate_public_ip_address = true
+    delete_on_termination       = true
+    security_groups             = [aws_eks_cluster.example.vpc_config[0].cluster_security_group_id]
+  }
 }
 
 resource "aws_eks_node_group" "main" {
   cluster_name    = aws_eks_cluster.example.name
-  node_group_name = "${var.prefix}-eks-nodes-${var.environment}"
+  node_group_name = local.node_group_name
   node_role_arn   = aws_iam_role.node.arn
-  subnet_ids      = aws_subnet.public[*].id
+  subnet_ids      = local.subnet_ids
 
-  capacity_type  = "ON_DEMAND"
-  instance_types = ["t3.medium"]
+  capacity_type  = var.capacity_type
+  instance_types = var.instance_types
+
+  launch_template {
+    id      = aws_launch_template.node.id
+    version = aws_launch_template.node.latest_version
+  }
 
   scaling_config {
-    min_size     = 1
-    max_size     = 3
-    desired_size = 2
+    min_size     = var.node_min
+    max_size     = var.node_max
+    desired_size = var.node_desired
   }
 
   update_config {

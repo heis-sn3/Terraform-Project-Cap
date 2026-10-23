@@ -1,6 +1,5 @@
-bucket = "seemat-s3-dev"
-key    = "dev/terraform.tfstate"
-region = "af-south-1"
-encrypt = true
-#not a valid argument
-#use_lockfile = true
+bucket       = "ntombela-sva-s3-dev"
+key          = "dev/terraform.tfstate"
+region       = "af-south-1"
+encrypt      = true
+use_lockfile = true

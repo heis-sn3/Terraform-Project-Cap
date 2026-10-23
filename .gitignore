@@ -1,7 +1,9 @@
 # Ignore Terraform directories and state files
 **/.terraform/
+.terraform-*/
 *.tfstate
 *.tfstate.*
 *.tfplan
 tfplan
 plan_output.txt
+
